@@ -1,12 +1,9 @@
-# Build stage
 FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
 # Copy go mod files
 COPY go.mod go.sum ./
-
-# Download dependencies
 RUN go mod download
 
 # Copy source code
@@ -18,19 +15,22 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
 # Final stage
 FROM alpine:latest
 
-# Install ca-certificates for HTTPS requests
-RUN apk --no-cache add ca-certificates tzdata
+# Install necessary packages
+RUN apk --no-cache add ca-certificates tzdata postgresql-client
 
 WORKDIR /root/
 
-# Copy the binary from builder stage
+# Copy binary from builder
 COPY --from=builder /app/main .
 
-# Create upload directory
+# Create upload directories
 RUN mkdir -p /app/uploads/clips
 
-# Expose port
+# Copy wait script
+COPY wait-for-db.sh .
+RUN chmod +x wait-for-db.sh
+
 EXPOSE 5009
 
-# Command to run
-CMD ["./main"]
+# Use wait script to ensure database is ready
+CMD ["./wait-for-db.sh", "./main"]

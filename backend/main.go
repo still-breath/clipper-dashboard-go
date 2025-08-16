@@ -93,29 +93,52 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// Database initialization
+// Database initialization with retries
 func initDatabase(config *Config) {
 	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 		config.DBHost, config.DBPort, config.DBUser, config.DBPassword, config.DBName)
 
 	var err error
-	db, err = sql.Open("postgres", connStr)
-	if err != nil {
-		log.Fatal("Failed to connect to database:", err)
+	maxRetries := 30
+	retryInterval := 2 * time.Second
+
+	for i := 0; i < maxRetries; i++ {
+		db, err = sql.Open("postgres", connStr)
+		if err != nil {
+			log.Printf("Attempt %d/%d: Failed to open database connection: %v", i+1, maxRetries, err)
+			time.Sleep(retryInterval)
+			continue
+		}
+
+		err = db.Ping()
+		if err != nil {
+			log.Printf("Attempt %d/%d: Failed to ping database: %v", i+1, maxRetries, err)
+			db.Close()
+			time.Sleep(retryInterval)
+			continue
+		}
+
+		// Connection successful
+		log.Println("Database connected successfully")
+		
+		// Set connection pool settings
+		db.SetMaxOpenConns(25)
+		db.SetMaxIdleConns(5)
+		db.SetConnMaxLifetime(5 * time.Minute)
+		
+		return
 	}
 
-	if err = db.Ping(); err != nil {
-		log.Fatal("Failed to ping database:", err)
-	}
-
-	log.Println("Database connected successfully")
+	log.Fatalf("Failed to connect to database after %d attempts: %v", maxRetries, err)
 }
 
 // Helper functions
 func sendJSONResponse(w http.ResponseWriter, statusCode int, response APIResponse) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Error encoding JSON response: %v", err)
+	}
 }
 
 func sendErrorResponse(w http.ResponseWriter, statusCode int, message string) {
@@ -126,24 +149,39 @@ func sendErrorResponse(w http.ResponseWriter, statusCode int, message string) {
 	})
 }
 
+// Logging middleware
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		log.Printf("Started %s %s", r.Method, r.URL.Path)
+		
+		next.ServeHTTP(w, r)
+		
+		log.Printf("Completed %s %s in %v", r.Method, r.URL.Path, time.Since(start))
+	})
+}
+
 // Court handlers
 func getCourts(w http.ResponseWriter, r *http.Request) {
 	nameFilter := r.URL.Query().Get("name")
+	log.Printf("Getting courts with name filter: '%s'", nameFilter)
 	
 	var query string
 	var args []interface{}
 	
 	if nameFilter != "" {
-		query = "SELECT id, name, description, is_active, created_at, updated_at FROM courts WHERE name ILIKE $1"
+		query = "SELECT id, name, description, is_active, created_at, updated_at FROM courts WHERE name ILIKE $1 AND is_active = true"
 		args = append(args, "%"+nameFilter+"%")
 	} else {
 		query = "SELECT id, name, description, is_active, created_at, updated_at FROM courts WHERE is_active = true"
 	}
 
+	log.Printf("Executing query: %s with args: %v", query, args)
+
 	rows, err := db.Query(query, args...)
 	if err != nil {
 		log.Printf("Error querying courts: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Failed to fetch courts")
+		sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to fetch courts: %v", err))
 		return
 	}
 	defer rows.Close()
@@ -154,19 +192,30 @@ func getCourts(w http.ResponseWriter, r *http.Request) {
 		err := rows.Scan(&court.ID, &court.Name, &court.Description, &court.IsActive, &court.CreatedAt, &court.UpdatedAt)
 		if err != nil {
 			log.Printf("Error scanning court: %v", err)
-			continue
+			sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Error scanning court data: %v", err))
+			return
 		}
 		courts = append(courts, court)
 	}
 
+	// Check for row iteration errors
+	if err = rows.Err(); err != nil {
+		log.Printf("Error iterating over court rows: %v", err)
+		sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Error processing court data: %v", err))
+		return
+	}
+
+	log.Printf("Found %d courts", len(courts))
+
 	if len(courts) == 0 && nameFilter != "" {
+		log.Printf("No courts found with name filter: %s", nameFilter)
 		sendErrorResponse(w, http.StatusNotFound, "Court not found")
 		return
 	}
 
 	sendJSONResponse(w, http.StatusOK, APIResponse{
 		Success: true,
-		Message: "Courts retrieved successfully",
+		Message: fmt.Sprintf("Courts retrieved successfully (%d found)", len(courts)),
 		Data:    courts,
 	})
 }
@@ -174,6 +223,7 @@ func getCourts(w http.ResponseWriter, r *http.Request) {
 func createCourt(w http.ResponseWriter, r *http.Request) {
 	var court Court
 	if err := json.NewDecoder(r.Body).Decode(&court); err != nil {
+		log.Printf("Error decoding court JSON: %v", err)
 		sendErrorResponse(w, http.StatusBadRequest, "Invalid JSON payload")
 		return
 	}
@@ -183,19 +233,24 @@ func createCourt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := `INSERT INTO courts (name, description) VALUES ($1, $2) RETURNING id, created_at, updated_at`
+	log.Printf("Creating court: %s", court.Name)
+
+	query := `INSERT INTO courts (name, description, is_active) VALUES ($1, $2, true) RETURNING id, created_at, updated_at`
 	err := db.QueryRow(query, court.Name, court.Description).Scan(&court.ID, &court.CreatedAt, &court.UpdatedAt)
 	if err != nil {
 		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			log.Printf("Court with name '%s' already exists", court.Name)
 			sendErrorResponse(w, http.StatusConflict, "Court with this name already exists")
 			return
 		}
 		log.Printf("Error creating court: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Failed to create court")
+		sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to create court: %v", err))
 		return
 	}
 
 	court.IsActive = true
+	log.Printf("Court created successfully with ID: %d", court.ID)
+	
 	sendJSONResponse(w, http.StatusCreated, APIResponse{
 		Success: true,
 		Message: "Court created successfully",
@@ -206,6 +261,7 @@ func createCourt(w http.ResponseWriter, r *http.Request) {
 // Booking hour handlers
 func getBookingHours(w http.ResponseWriter, r *http.Request) {
 	courtIDStr := r.URL.Query().Get("courtId")
+	log.Printf("Getting booking hours with court ID filter: '%s'", courtIDStr)
 	
 	var query string
 	var args []interface{}
@@ -225,7 +281,7 @@ func getBookingHours(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(query, args...)
 	if err != nil {
 		log.Printf("Error querying booking hours: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Failed to fetch booking hours")
+		sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to fetch booking hours: %v", err))
 		return
 	}
 	defer rows.Close()
@@ -241,9 +297,11 @@ func getBookingHours(w http.ResponseWriter, r *http.Request) {
 		bookingHours = append(bookingHours, bh)
 	}
 
+	log.Printf("Found %d booking hours", len(bookingHours))
+
 	sendJSONResponse(w, http.StatusOK, APIResponse{
 		Success: true,
-		Message: "Booking hours retrieved successfully",
+		Message: fmt.Sprintf("Booking hours retrieved successfully (%d found)", len(bookingHours)),
 		Data:    bookingHours,
 	})
 }
@@ -251,6 +309,7 @@ func getBookingHours(w http.ResponseWriter, r *http.Request) {
 func createBookingHour(w http.ResponseWriter, r *http.Request) {
 	var bh BookingHour
 	if err := json.NewDecoder(r.Body).Decode(&bh); err != nil {
+		log.Printf("Error decoding booking hour JSON: %v", err)
 		sendErrorResponse(w, http.StatusBadRequest, "Invalid JSON payload")
 		return
 	}
@@ -265,15 +324,18 @@ func createBookingHour(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("Creating booking hour for court %d from %v to %v", bh.CourtID, bh.DateStart, bh.DateEnd)
+
 	// Verify court exists
 	var exists bool
 	err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM courts WHERE id = $1 AND is_active = true)", bh.CourtID).Scan(&exists)
 	if err != nil {
 		log.Printf("Error checking court existence: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Failed to verify court")
+		sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to verify court: %v", err))
 		return
 	}
 	if !exists {
+		log.Printf("Court %d not found or inactive", bh.CourtID)
 		sendErrorResponse(w, http.StatusBadRequest, "Court not found or inactive")
 		return
 	}
@@ -286,9 +348,11 @@ func createBookingHour(w http.ResponseWriter, r *http.Request) {
 	err = db.QueryRow(query, bh.CourtID, bh.DateStart, bh.DateEnd, bh.Status).Scan(&bh.ID, &bh.CreatedAt, &bh.UpdatedAt)
 	if err != nil {
 		log.Printf("Error creating booking hour: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Failed to create booking hour")
+		sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to create booking hour: %v", err))
 		return
 	}
+
+	log.Printf("Booking hour created successfully with ID: %d", bh.ID)
 
 	sendJSONResponse(w, http.StatusCreated, APIResponse{
 		Success: true,
@@ -299,9 +363,12 @@ func createBookingHour(w http.ResponseWriter, r *http.Request) {
 
 // Clip handlers
 func uploadClip(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Starting clip upload")
+	
 	// Parse multipart form
-	err := r.ParseMultipartForm(100 << 20) // 100MB max
+	err := r.ParseMultipartForm(100 << 20)
 	if err != nil {
+		log.Printf("Error parsing multipart form: %v", err)
 		sendErrorResponse(w, http.StatusBadRequest, "Failed to parse form")
 		return
 	}
@@ -319,15 +386,18 @@ func uploadClip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("Upload for booking hour ID: %d", bookingHourID)
+
 	// Verify booking hour exists
 	var exists bool
 	err = db.QueryRow("SELECT EXISTS(SELECT 1 FROM booking_hours WHERE id = $1)", bookingHourID).Scan(&exists)
 	if err != nil {
 		log.Printf("Error checking booking hour existence: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Failed to verify booking hour")
+		sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to verify booking hour: %v", err))
 		return
 	}
 	if !exists {
+		log.Printf("Booking hour %d not found", bookingHourID)
 		sendErrorResponse(w, http.StatusBadRequest, "Booking hour not found")
 		return
 	}
@@ -335,10 +405,13 @@ func uploadClip(w http.ResponseWriter, r *http.Request) {
 	// Get the uploaded file
 	file, handler, err := r.FormFile("video")
 	if err != nil {
+		log.Printf("Error getting uploaded file: %v", err)
 		sendErrorResponse(w, http.StatusBadRequest, "No video file provided")
 		return
 	}
 	defer file.Close()
+
+	log.Printf("Received file: %s, size: %d bytes", handler.Filename, handler.Size)
 
 	// Create upload directory if it doesn't exist
 	config := loadConfig()
@@ -354,6 +427,8 @@ func uploadClip(w http.ResponseWriter, r *http.Request) {
 	ext := filepath.Ext(handler.Filename)
 	filename := fmt.Sprintf("clip_%d_%s%s", bookingHourID, timestamp, ext)
 	filePath := filepath.Join(uploadDir, filename)
+
+	log.Printf("Saving file to: %s", filePath)
 
 	// Save file
 	dst, err := os.Create(filePath)
@@ -371,6 +446,8 @@ func uploadClip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("File saved successfully, size: %d bytes", fileSize)
+
 	// Get MIME type
 	mimeType := handler.Header.Get("Content-Type")
 	if mimeType == "" {
@@ -387,6 +464,19 @@ func uploadClip(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Get additional metadata from form
+	description := r.FormValue("description")
+	cameraName := r.FormValue("camera_name")
+	if cameraName == "" && description != "" {
+		parts := strings.Split(description, " ")
+		for i, part := range parts {
+			if part == "camera" && i > 0 {
+				cameraName = parts[i-1]
+				break
+			}
+		}
+	}
+
 	// Save clip metadata to database
 	clip := Clip{
 		BookingHourID: bookingHourID,
@@ -397,15 +487,21 @@ func uploadClip(w http.ResponseWriter, r *http.Request) {
 		UploadStatus:  "uploaded",
 	}
 
-	query := `INSERT INTO clips (booking_hour_id, filename, file_path, file_size, mime_type, upload_status) 
-			  VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at, updated_at`
-	err = db.QueryRow(query, clip.BookingHourID, clip.Filename, clip.FilePath, clip.FileSize, clip.MimeType, clip.UploadStatus).
+	if cameraName != "" {
+		clip.CameraName = &cameraName
+	}
+
+	query := `INSERT INTO clips (booking_hour_id, filename, file_path, file_size, mime_type, camera_name, upload_status) 
+			  VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, created_at, updated_at`
+	err = db.QueryRow(query, clip.BookingHourID, clip.Filename, clip.FilePath, clip.FileSize, clip.MimeType, clip.CameraName, clip.UploadStatus).
 		Scan(&clip.ID, &clip.CreatedAt, &clip.UpdatedAt)
 	if err != nil {
 		log.Printf("Error saving clip metadata: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Failed to save clip metadata")
+		sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to save clip metadata: %v", err))
 		return
 	}
+
+	log.Printf("Clip uploaded successfully with ID: %d", clip.ID)
 
 	sendJSONResponse(w, http.StatusCreated, APIResponse{
 		Success: true,
@@ -416,6 +512,7 @@ func uploadClip(w http.ResponseWriter, r *http.Request) {
 
 func getClips(w http.ResponseWriter, r *http.Request) {
 	bookingHourIDStr := r.URL.Query().Get("bookingHourId")
+	log.Printf("Getting clips with booking hour ID filter: '%s'", bookingHourIDStr)
 	
 	var query string
 	var args []interface{}
@@ -439,7 +536,7 @@ func getClips(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(query, args...)
 	if err != nil {
 		log.Printf("Error querying clips: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Failed to fetch clips")
+		sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to fetch clips: %v", err))
 		return
 	}
 	defer rows.Close()
@@ -457,21 +554,33 @@ func getClips(w http.ResponseWriter, r *http.Request) {
 		clips = append(clips, clip)
 	}
 
+	log.Printf("Found %d clips", len(clips))
+
 	sendJSONResponse(w, http.StatusOK, APIResponse{
 		Success: true,
-		Message: "Clips retrieved successfully",
+		Message: fmt.Sprintf("Clips retrieved successfully (%d found)", len(clips)),
 		Data:    clips,
 	})
 }
 
 // Health check
 func healthCheck(w http.ResponseWriter, r *http.Request) {
+	// Test database connection
+	var dbStatus string
+	if err := db.Ping(); err != nil {
+		dbStatus = "disconnected"
+		log.Printf("Database health check failed: %v", err)
+	} else {
+		dbStatus = "connected"
+	}
+
 	sendJSONResponse(w, http.StatusOK, APIResponse{
 		Success: true,
 		Message: "Service is healthy",
 		Data: map[string]interface{}{
 			"timestamp": time.Now().Format(time.RFC3339),
 			"version":   "1.0.0",
+			"database":  dbStatus,
 		},
 	})
 }
@@ -480,12 +589,24 @@ func main() {
 	// Load configuration
 	config := loadConfig()
 
+	log.Printf("Starting CCTV Backend API Server")
+	log.Printf("Database: %s:%s/%s", config.DBHost, config.DBPort, config.DBName)
+	log.Printf("Upload Directory: %s", config.UploadDir)
+
 	// Initialize database
 	initDatabase(config)
 	defer db.Close()
 
+	// Create upload directory
+	if err := os.MkdirAll(filepath.Join(config.UploadDir, "clips"), 0755); err != nil {
+		log.Printf("Warning: Could not create upload directory: %v", err)
+	}
+
 	// Create router
 	router := mux.NewRouter()
+
+	// Add logging middleware
+	router.Use(loggingMiddleware)
 
 	// API routes
 	api := router.PathPrefix("/api/v1").Subrouter()
@@ -502,21 +623,29 @@ func main() {
 	api.HandleFunc("/booking-hours", createBookingHour).Methods("POST")
 
 	// Clip routes
-	api.HandleFunc("/clips/upload", uploadClip).Methods("POST")
+	api.HandleFunc("/clips", uploadClip).Methods("POST")
 	api.HandleFunc("/clips", getClips).Methods("GET")
 
 	// Setup CORS
 	c := cors.New(cors.Options{
-		AllowedOrigins: []string{"*"},
-		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders: []string{"*"},
+		AllowedOrigins:   []string{"*"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"*"},
 		AllowCredentials: true,
+		Debug:            true,
 	})
 
 	handler := c.Handler(router)
 
 	// Start server
 	log.Printf("Server starting on port %s", config.ServerPort)
-	log.Printf("Upload directory: %s", config.UploadDir)
-	log.Fatal(http.ListenAndServe(":"+config.ServerPort, handler))
+	log.Printf("API endpoints:")
+	log.Printf("  Health: GET /api/v1/health")
+	log.Printf("  Courts: GET/POST /api/v1/courts")
+	log.Printf("  Booking Hours: GET/POST /api/v1/booking-hours")
+	log.Printf("  Clips: GET/POST /api/v1/clips")
+	
+	if err := http.ListenAndServe(":"+config.ServerPort, handler); err != nil {
+		log.Fatal("Server failed to start:", err)
+	}
 }

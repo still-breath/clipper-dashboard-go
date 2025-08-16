@@ -77,7 +77,7 @@ test_file_upload() {
         -X POST \
         -F "video=@$test_file" \
         -F "bookingHourId=$booking_hour_id" \
-        "$BASE_URL/clips/upload")
+        "$BASE_URL/clips")
     
     status_code=$(echo "$response" | tail -n1)
     body=$(echo "$response" | sed '$d')

@@ -27,7 +27,7 @@ A Go-based microservice backend for the Flask CCTV surveillance system. This ser
 - `POST /api/v1/booking-hours` - Create a new booking hour
 
 ### Clips
-- `POST /api/v1/clips/upload` - Upload video clip
+`POST /api/v1/clips` - Upload video clip
 - `GET /api/v1/clips` - Get clips (with optional bookingHourId filter)
 
 ## Quick Start
