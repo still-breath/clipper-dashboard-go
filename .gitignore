@@ -1,0 +1,85 @@
+# Environment variables
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+bin/
+tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Uploads & Generated Files
+uploads/
+clips/
+recordings/
+snapshots/
+temp_clips/
+test_uploads/
+
+# Docker
+docker-compose.override.yml
+
+# Node modules (if any)
+node_modules/
+npm-debug.log*
+
+# Build artifacts
+dist/
+build/
+*.tar.gz
+
+# Backup files
+*.bak
+*.backup
+*.sql.backup
+
+# Local configuration
+config.local.*
+settings.local.*
